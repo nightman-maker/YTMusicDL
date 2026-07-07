@@ -18,12 +18,13 @@ Usage:
 
 import argparse
 import asyncio
+import datetime
 import logging
+import os
 import re
 import sys
+import traceback
 from pathlib import Path
-
-import sys
 
 from rich.console import Console
 from rich.panel import Panel
@@ -54,6 +55,26 @@ from utils import (
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def _error_log_path() -> str:
+    """Return the path to the current error log file."""
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"error_{ts}.log")
+
+
+def _write_error_log(exc: BaseException) -> None:
+    """Write full traceback of *exc* to a dated error log file."""
+    path = _error_log_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"Error logged at {datetime.datetime.now().isoformat()}\n")
+            f.write("=" * 72 + "\n\n")
+            f.write(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.info("Full error details written to %s", path)
+    except OSError:
+        # If we can't write the file, fall back to stderr
+        traceback.print_exc()
 
 
 # ─── CLI Argument Parsing ──────────────────────────────────────────────
@@ -648,10 +669,24 @@ async def main() -> int:
         print("(!) Interrupted by user.")
         return 130
     except Exception as e:
-        logger.exception("Unexpected error")
-        # Provide helpful messages for common errors
-        err_str = str(e)
-        if "playlistNotFound" in err_str or "404" in err_str and "playlistId" in err_str:
+        # Always log full traceback to a dated error file
+        _write_error_log(e)
+
+        err_str = str(e).lower()
+
+        if "api key not valid" in err_str or "invalid api key" in err_str:
+            print(
+                "(FAIL) Invalid Google API Key.\n"
+                "  Get a free key at: https://console.cloud.google.com/apis/credentials\n"
+                "  Then add it to .env as GOOGLE_API_KEY=your_key_here"
+            )
+        elif "quota exceeded" in err_str or "403" in err_str:
+            print(
+                "(FAIL) API quota exceeded or key not authorized. Check:\n"
+                "  - YouTube Data API v3 is enabled in Google Cloud Console\n"
+                "  - You haven't exceeded your daily quota (10,000 units/day)"
+            )
+        elif "playlistnotfound" in err_str or ("404" in err_str and "playlistid" in err_str):
             print(
                 "(FAIL) Playlist not found. This can happen if:\n"
                 "  - The playlist is private or unlisted\n"
@@ -659,17 +694,13 @@ async def main() -> int:
                 "  - The playlist ID is incorrect\n"
                 "Try a public playlist URL instead."
             )
-        elif "quotaExceeded" in err_str.lower() or "403" in err_str:
-            print(
-                "(FAIL) API quota exceeded or key not authorized. Check:\n"
-                "  - Your GOOGLE_API_KEY is correct\n"
-                "  - YouTube Data API v3 is enabled in Google Cloud Console\n"
-                "  - You haven't exceeded your daily quota (10,000 units/day)"
-            )
-        elif "videoNotFound" in err_str or "404" in err_str:
+        elif "videonotfound" in err_str or ("404" in err_str and "video" in err_str):
             print("(FAIL) Video not found. Check the URL or video ID.")
         else:
-            print(f"(FAIL) Error: {e}")
+            # Short message for unknown errors — full details are in the log file
+            short = str(e).splitlines()[0][:120]
+            print(f"(FAIL) {short}")
+            print("  Full error logged to: " + _error_log_path())
         return 1
 
     # Print summary

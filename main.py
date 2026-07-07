@@ -70,7 +70,7 @@ def _write_error_log(exc: BaseException) -> None:
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"Error logged at {datetime.datetime.now().isoformat()}\n")
             f.write("=" * 72 + "\n\n")
-            f.write(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            f.writelines(traceback.format_exception(type(exc), exc, exc.__traceback__))
         logger.info("Full error details written to %s", path)
     except OSError:
         # If we can't write the file, fall back to stderr

@@ -16,10 +16,12 @@ import logging
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import mutagen
@@ -28,6 +30,17 @@ import mutagen.flac
 import mutagen.oggopus
 import yt_dlp
 import ytmusicapi
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -201,12 +214,21 @@ def _get_audio_url(video_id: str, audio_codec: str = "mp3") -> str | None:
 
 # ─── Audio download via requests + ffmpeg ─────────────────────────────
 
+_FFMPEG_PROGRESS_RE = re.compile(
+    r"time=(\d+):(\d{2}):(\d{2})\.?(\d*)"
+)
+
+
 def _transcode_audio(
     input_path: Path,
     output_path: Path,
     codec: str,
+    progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> bool:
-    """Transcode audio file to target format using ffmpeg."""
+    """Transcode audio file to target format using ffmpeg.
+
+    Parses ffmpeg's stderr for time-based progress and reports it via callback.
+    """
     global _FFMPEG_PATH
     if _FFMPEG_PATH is None:
         _check_ffmpeg()
@@ -240,20 +262,66 @@ def _transcode_audio(
         return False
 
     try:
-        result = subprocess.run(
+        # Get input duration for progress calculation
+        input_duration = 0
+        if progress_callback and output_path.exists():
+            # Probe the input file to get its duration
+            probe_cmd = [
+                ffmpeg_exe, "-i", str(input_path),
+                "-f", "null", "-"
+            ]
+            try:
+                probe = subprocess.run(
+                    probe_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                # Parse duration from stderr: "Duration: 00:03:45.12"
+                dur_match = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2})\.?(\d*)", probe.stderr)
+                if dur_match:
+                    h, m, s, _ = dur_match.groups()
+                    input_duration = int(h) * 3600 + int(m) * 60 + int(s)
+            except Exception:
+                pass
+
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=300,  # 5 min max per file
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
         )
-        if result.returncode != 0:
-            logger.error(f"ffmpeg error: {result.stderr[:200]}")
+
+        last_progress_time = 0.0
+        while True:
+            line = proc.stderr.readline()
+            if not line and proc.poll() is not None:
+                break
+
+            if progress_callback and input_duration > 0:
+                now = time.time()
+                # Throttle progress updates to ~1 per second
+                if now - last_progress_time < 1.0:
+                    continue
+                last_progress_time = now
+
+                match = _FFMPEG_PROGRESS_RE.search(line)
+                if match:
+                    h, m, s, _ = match.groups()
+                    elapsed = int(h) * 3600 + int(m) * 60 + int(s)
+                    progress_callback(elapsed, input_duration)
+
+        proc.wait()
+
+        if proc.returncode != 0:
+            stderr_output = proc.stderr.read() if not line else ""
+            logger.error(f"ffmpeg error: {stderr_output[:200]}")
             return False
         return True
 
-    except subprocess.TimeoutExpired:
-        logger.error("ffmpeg timed out transcoding")
-        return False
     except FileNotFoundError:
         logger.error(
             "ffmpeg not found. Install it from https://ffmpeg.org/download.html\n"
@@ -341,8 +409,35 @@ _YTMUSIC_HEADERS = {
 }
 
 
-def _download_stream(url: str, output_path: Path) -> bool:
-    """Download an audio stream with retries and proper headers."""
+def _format_bytes(size: int) -> str:
+    """Format bytes into human-readable string."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if abs(size) < 1024.0:
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TB"
+
+
+_MULTI_CONNECTIONS = 4  # Parallel connections per file (tune for speed)
+_CHUNK_SIZE = 1024 * 64  # 64 KB read chunks
+
+
+def _download_stream(
+    url: str,
+    output_path: Path,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+) -> bool:
+    """Download an audio stream with retries and proper headers.
+
+    Uses multi-connection (parallel chunk) downloads by default for speed.
+    Falls back to single connection if the server doesn't support Range requests.
+
+    Args:
+        url: The URL to download from.
+        output_path: Where to save the file.
+        progress_callback: Called as callback(downloaded_bytes, total_bytes).
+                           total_bytes may be None if Content-Length is unknown.
+    """
     last_error = None
 
     for attempt in range(3):
@@ -352,23 +447,44 @@ def _download_stream(url: str, output_path: Path) -> bool:
             time.sleep(delay)
 
         try:
-            with requests.get(
+            # Step 1: HEAD request to get file size and check Range support
+            head_resp = requests.head(
                 url,
                 headers=_YTMUSIC_HEADERS,
-                timeout=600,  # 10 min max
-                stream=True,
-            ) as response:
-                if response.status_code != 200:
-                    logger.error(f"HTTP {response.status_code} downloading stream")
-                    last_error = f"HTTP {response.status_code}"
-                    continue
+                timeout=30,
+            )
+            if head_resp.status_code != 200:
+                logger.error(f"HEAD request failed: HTTP {head_resp.status_code}")
+                last_error = f"HTTP {head_resp.status_code}"
+                continue
 
-                with open(output_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=1024 * 64):
-                        if chunk:
-                            f.write(chunk)
+            total_size_header = head_resp.headers.get("Content-Length")
+            accept_ranges = head_resp.headers.get("Accept-Ranges", "")
+            file_size: int | None = (
+                int(total_size_header) if total_size_header else None
+            )
 
-            return output_path.exists() and output_path.stat().st_size > 0
+            # Step 2: Try multi-connection download if server supports it
+            use_multi = (
+                file_size is not None
+                and ("bytes" in accept_ranges.lower() or "range" in url)
+                and file_size > 1024 * 512  # Only for files > 512KB
+            )
+
+            if use_multi:
+                downloaded = _download_stream_multi(
+                    url, output_path, file_size,
+                    progress_callback=progress_callback,
+                )
+            else:
+                # Fallback: single connection with streaming
+                downloaded = _download_stream_single(
+                    url, output_path, file_size,
+                    progress_callback=progress_callback,
+                )
+
+            if downloaded:
+                return True
 
         except requests.exceptions.ConnectionError as e:
             last_error = str(e)
@@ -386,6 +502,169 @@ def _download_stream(url: str, output_path: Path) -> bool:
 
     logger.error(f"Stream download failed after retries: {last_error}")
     return False
+
+
+def _download_stream_single(
+    url: str,
+    output_path: Path,
+    total_bytes: int | None,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+) -> bool:
+    """Download using a single HTTP connection (fallback mode)."""
+    try:
+        with requests.get(
+            url,
+            headers=_YTMUSIC_HEADERS,
+            timeout=600,  # 10 min max
+            stream=True,
+        ) as response:
+            if response.status_code != 200:
+                logger.error(f"HTTP {response.status_code} downloading stream")
+                return False
+
+            downloaded = 0
+
+            with open(output_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    if progress_callback and (downloaded % (1024 * 512) < _CHUNK_SIZE):
+                        progress_callback(downloaded, total_bytes)
+
+            return output_path.exists() and output_path.stat().st_size > 0
+
+    except Exception as e:
+        logger.warning(f"Single-connection download failed: {e}")
+        return False
+
+
+def _download_stream_multi(
+    url: str,
+    output_path: Path,
+    total_bytes: int,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+) -> bool:
+    """Download using multiple parallel HTTP Range connections.
+
+    Splits the file into N chunks and downloads them simultaneously,
+    then merges them in order. This can significantly increase download speed
+    by saturating the connection bandwidth.
+    """
+    num_connections = min(_MULTI_CONNECTIONS, max(2, total_bytes // (1024 * 512)))
+    chunk_size = total_bytes // num_connections
+
+    # Create temp files for each chunk
+    chunk_files: list[Path] = []
+    try:
+        for i in range(num_connections):
+            start = i * chunk_size
+            end = (start + chunk_size - 1) if i < num_connections - 1 else total_bytes - 1
+            chunk_path = Path(str(output_path) + f".part{i}")
+            chunk_files.append(chunk_path)
+
+        # Download each chunk in parallel using threads
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def _download_chunk(idx: int, start: int, end: int) -> None:
+            """Download a single range and write to temp file."""
+            headers = dict(_YTMUSIC_HEADERS)
+            headers["Range"] = f"bytes={start}-{end}"
+
+            try:
+                with requests.get(
+                    url,
+                    headers=headers,
+                    timeout=600,
+                    stream=True,
+                ) as response:
+                    if response.status_code not in (200, 206):
+                        with lock:
+                            errors.append(f"Chunk {idx}: HTTP {response.status_code}")
+                        return
+
+                    downloaded = 0
+                    expected_size = end - start + 1
+
+                    with open(chunk_files[idx], "wb") as f:
+                        for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+            except Exception as e:
+                with lock:
+                    errors.append(f"Chunk {idx}: {e}")
+
+        threads: list[threading.Thread] = []
+        for i in range(num_connections):
+            start = i * chunk_size
+            end = (start + chunk_size - 1) if i < num_connections - 1 else total_bytes - 1
+            t = threading.Thread(
+                target=_download_chunk,
+                args=(i, start, end),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        # Wait for all threads with progress reporting
+        import time as _time
+        last_report = 0.0
+        while any(t.is_alive() for t in threads):
+            now = _time.time()
+            if now - last_report >= 1.0:
+                last_report = now
+                # Calculate total downloaded from completed chunks + current progress
+                total_downloaded = 0
+                for i, t in enumerate(threads):
+                    if not t.is_alive() and chunk_files[i].exists():
+                        total_downloaded += chunk_files[i].stat().st_size
+                    elif t.is_alive() and chunk_files[i].exists():
+                        # Estimate: thread is alive but file exists = partial write
+                        try:
+                            total_downloaded += chunk_files[i].stat().st_size
+                        except Exception:
+                            pass
+                if progress_callback:
+                    progress_callback(total_downloaded, total_bytes)
+            _time.sleep(0.1)
+
+        # Wait for all threads to finish
+        for t in threads:
+            t.join(timeout=610)
+
+        if errors:
+            logger.warning(f"Multi-connection download had errors: {errors}")
+            return False
+
+        # Merge chunks into final file (in order, no gaps expected)
+        with open(output_path, "wb") as out:
+            for chunk_file in chunk_files:
+                if not chunk_file.exists():
+                    logger.error(f"Missing chunk: {chunk_file}")
+                    return False
+                with open(chunk_file, "rb") as inp:
+                    while True:
+                        data = inp.read(1024 * 1024)  # 1 MB read for merge
+                        if not data:
+                            break
+                        out.write(data)
+
+        return output_path.exists() and output_path.stat().st_size == total_bytes
+
+    finally:
+        # Clean up chunk files on any failure path
+        for cf in chunk_files:
+            try:
+                if cf.exists():
+                    cf.unlink()
+            except Exception:
+                pass
 
 
 # ─── Main Downloader Class ────────────────────────────────────────────
@@ -481,6 +760,9 @@ class AudioDownloader:
             logger.info(f"Already exists: {result.title} -> {existing_file}")
             return result
 
+        # Prepare display name for progress bar
+        track_display = f"{artist} - {title}" if artist and artist != "Unknown Artist" else title or video_id
+
         try:
             # Step 1: Get metadata from ytmusicapi (FREE — no quota)
             ytm = get_ytmusic()
@@ -497,27 +779,84 @@ class AudioDownloader:
             if not audio_url:
                 raise RuntimeError("No audio stream URL found for this video")
 
-            # Step 3: Download raw audio stream to a temp file
-            temp_path = Path(filename_template + ".raw")
-            downloaded = _download_stream(audio_url, temp_path)
-            if not downloaded:
-                raise RuntimeError("Failed to download audio stream")
+            with Progress(
+                TextColumn("[bold cyan]{task.fields[track]}[/bold cyan]"),
+                SpinnerColumn(spinner_name="dots", style="blue"),
+                BarColumn(bar_width=30),
+                TextColumn("{task.percentage:>6.1f}%"),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeRemainingColumn(),
+                console=Console(file=sys.stderr, force_terminal=True, color_system="standard" if sys.platform == "win32" else None),
+            ) as progress:
 
-            # Step 4: Transcode to target format
-            output_path = Path(filename_template)
-            transcoded = _transcode_audio(temp_path, output_path, self.audio_codec)
+                # ── Step 3: Download with progress bar ───────────────────────
+                download_task = progress.add_task(
+                    f"[{track_display}]",
+                    track=track_display,
+                    total=None,  # Unknown total initially (YouTube streams often omit Content-Length)
+                )
 
-            # Clean up temp file
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
+                temp_path = Path(filename_template + ".raw")
+                downloaded_bytes = [0]
+                total_size = [None]
 
-            if not transcoded or not output_path.exists():
-                raise RuntimeError("Transcoding failed")
+                def _download_progress(downloaded: int, total: int | None) -> None:
+                    """Update the Rich progress bar in real-time."""
+                    downloaded_bytes[0] = downloaded
+                    if total is not None:
+                        total_size[0] = total
+                        progress.update(download_task, total=total, completed=downloaded)
+                    else:
+                        # No Content-Length — show bytes without percentage
+                        progress.update(download_task, completed=downloaded)
 
-            # Step 5: Embed metadata tags
+                downloaded = _download_stream(audio_url, temp_path, progress_callback=_download_progress)
+
+                if not downloaded:
+                    raise RuntimeError("Failed to download audio stream")
+
+                # Finalize: set total to actual file size (in case Content-Length was wrong/missing)
+                file_size = temp_path.stat().st_size
+                progress.update(download_task, total=file_size, completed=file_size)
+
+                # ── Step 4: Transcode with progress bar ───────────────────────
+                output_path = Path(filename_template)
+                transcode_elapsed = [0]
+                transcode_total = [None]  # Duration in seconds
+
+                def _transcode_progress(elapsed: int, total: int | None) -> None:
+                    """Update the Rich progress bar with ffmpeg time-based progress."""
+                    transcode_elapsed[0] = elapsed
+                    if total is not None:
+                        transcode_total[0] = total
+                        # Convert seconds to a fraction for the progress bar
+                        progress.update(transcode_task, total=total, completed=elapsed)
+                    else:
+                        progress.update(transcode_task, completed=elapsed)
+
+                transcode_task = progress.add_task(
+                    f"[{track_display}]",
+                    track=track_display,
+                    total=None,  # Duration unknown initially
+                )
+
+                transcoded = _transcode_audio(
+                    temp_path, output_path, self.audio_codec,
+                    progress_callback=_transcode_progress,
+                )
+
+                # Clean up temp file
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except Exception:
+                    pass
+
+                if not transcoded or not output_path.exists():
+                    raise RuntimeError("Transcoding failed")
+
+            # Step 5: Embed metadata tags (fast, no progress bar needed)
             _embed_metadata(
                 file_path=output_path,
                 title=sanitize_filename(video_title) if video_title else "",

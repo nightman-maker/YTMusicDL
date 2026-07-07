@@ -29,3 +29,5 @@ venv/
 Thumbs.db
 /.vs
 /ffmpeg.exe
+ffplay.exe
+ffprobe.exe

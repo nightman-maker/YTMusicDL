@@ -194,7 +194,7 @@ class YouTubeAPIClient:
                 q=query,
                 type="video",
                 maxResults=max_results,
-                videoEmbeddable=True,
+                videoEmbeddable="true",
                 relevanceLanguage="en",
             )
             .execute()

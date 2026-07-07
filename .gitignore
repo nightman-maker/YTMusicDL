@@ -1,0 +1,31 @@
+# Environment variables with API keys
+.env
+
+# Downloaded music (usually large)
+downloads/
+*.m4a
+*.opus
+*.mp3
+*.webm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+/.vs
+/ffmpeg.exe

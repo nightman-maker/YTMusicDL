@@ -677,10 +677,12 @@ class AudioDownloader:
         output_dir: Path,
         audio_codec: str = "mp3",
         max_concurrent: int = 2,
+        resolve_tags: bool = True,
     ):
         self.output_dir = output_dir
         self.audio_codec = audio_codec
         self.max_concurrent = max_concurrent
+        self.resolve_tags = resolve_tags
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     def extract_playlist_ids_from_ytmusic(self, playlist_url_or_id: str) -> list[str]:
@@ -701,7 +703,7 @@ class AudioDownloader:
         genre: str = "Unknown",
         track_number: int = 0,
     ) -> DownloadResult:
-        """Download a single track with metadata embedding."""
+        """Download a single track with metadata embedding and optional tag resolution."""
 
         async with self._semaphore:
             return await asyncio.to_thread(
@@ -725,6 +727,12 @@ class AudioDownloader:
         genre: str = "Unknown",
         track_number: int = 0,
     ) -> DownloadResult:
+        """Perform the actual download (runs in thread pool).
+
+        After transcoding and initial tag embedding, if resolve_tags is enabled,
+        fetches fresh metadata from YouTube Music API and overwrites all ID3 tags.
+        The video ID is stored in a custom TXXX frame for future resolution.
+        """
         """Perform the actual download (runs in thread pool)."""
 
         # Build output filename template
@@ -856,7 +864,7 @@ class AudioDownloader:
                 if not transcoded or not output_path.exists():
                     raise RuntimeError("Transcoding failed")
 
-            # Step 5: Embed metadata tags (fast, no progress bar needed)
+            # Step 5: Embed initial metadata tags (fast, no progress bar needed)
             _embed_metadata(
                 file_path=output_path,
                 title=sanitize_filename(video_title) if video_title else "",
@@ -866,6 +874,25 @@ class AudioDownloader:
                 genre=genre if genre != "Unknown" else "",
                 track_number=track_number,
             )
+
+            # Step 6: Resolve tags with fresh metadata from YouTube Music API
+            if self.resolve_tags:
+                try:
+                    from tag_resolver import resolve_file_tags
+
+                    resolved = resolve_file_tags(output_path)
+                    if resolved["success"]:
+                        logger.info(
+                            f"Tags resolved for {output_path.name}: "
+                            f"{', '.join(resolved['changes'])}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Tag resolution failed for {output_path.name}, "
+                            f"keeping initial tags"
+                        )
+                except Exception as e:
+                    logger.debug(f"Tag resolution skipped: {e}")
 
             result.success = True
             result.file_path = output_path

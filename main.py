@@ -125,6 +125,18 @@ Metadata is extracted from yt-dlp (FREE). YouTube API is used only as fallback.
     parser.add_argument(
         "--quiet", "-q", action="store_true", help="Suppress progress output"
     )
+    parser.add_argument(
+        "--resolve-tags", "-r", action="store_true",
+        help="Resolve and update tags with fresh metadata from YouTube Music (default: on)",
+    )
+    parser.add_argument(
+        "--no-resolve", action="store_true",
+        help="Disable automatic tag resolution after download",
+    )
+    parser.add_argument(
+        "--resolve-all", action="store_true",
+        help="Resolve tags for all previously downloaded songs in the output directory",
+    )
 
     return parser
 
@@ -570,6 +582,85 @@ async def search_and_download(
             print("(error) Invalid input. Enter a number or 'a'.")
 
 
+# ─── Resolve Tags Batch Command ──────────────────────────────────────
+
+async def _cmd_resolve_all(config: Config) -> None:
+    """Resolve tags for all previously downloaded songs in the output directory."""
+
+    console.print(Panel.fit(
+        "[bold cyan]Tag Resolver[/bold cyan]\n"
+        f"[dim]Scanning: {config.output_dir}[/dim]",
+        subtitle="Fetching fresh metadata from YouTube Music API",
+    ))
+
+    # Check ffmpeg is available (needed for reading duration)
+    from downloader import _check_ffmpeg
+    if not _check_ffmpeg():
+        print("(ERROR) ffmpeg is required but was not found on PATH.")
+        return
+
+    from tag_resolver import resolve_all_files, find_audio_files
+
+    files = find_audio_files(config.output_dir)
+    total = len(files)
+
+    if total == 0:
+        console.print(f"\n[dim]No audio files found in {config.output_dir}[/dim]")
+        return
+
+    print(f"\nFound {total} audio file(s) to resolve.\n")
+
+    # Show what we're about to process
+    for idx, f in enumerate(files[:20], 1):  # Limit preview
+        rel = f.relative_to(config.output_dir)
+        console.print(f"  {idx}. [dim]{rel}[/dim]")
+    if total > 20:
+        print(f"  ... and {total - 20} more")
+
+    confirm = input("\nProceed? (y/N): ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        return
+
+    # Run resolution
+    summary = resolve_all_files(config.output_dir)
+
+    # Print results
+    console.print(f"\n[bold]Results:[/bold]")
+    console.print(f"  Total:   {summary['total']}")
+    console.print(f"  Updated: [green]{summary['success']}[/green]")
+    if summary['failed']:
+        console.print(f"  Failed:  [red]{summary['failed']}[/red]")
+
+    # Show details for updated files
+    updated = [r for r in summary['results'] if r['success']]
+    if updated:
+        table = Table(title="Updated Files")
+        table.add_column("File", style="cyan", no_wrap=True)
+        table.add_column("Changes", style="white")
+
+        for entry in updated[:50]:  # Limit display
+            changes_str = ", ".join(entry['changes']) if entry['changes'] else "none"
+            console.print(
+                f"  ✓ {entry['file']} — changed: {changes_str}"
+            )
+
+    failed = [r for r in summary['results'] if not r['success']]
+    if failed:
+        print(f"\n[dim]Files that could not be resolved ({len(failed)}):[/dim]")
+        for entry in failed[:20]:
+            console.print(f"  ✗ {entry['file']}")
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more")
+
+    # Print summary stats
+    total_changes = sum(len(r['changes']) for r in updated)
+    if total_changes > 0:
+        console.print(
+            f"\n[dim]Total fields updated: {total_changes}[/dim]"
+        )
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────────
 
 async def main() -> int:
@@ -628,6 +719,9 @@ async def main() -> int:
         subtitle="Production Edition - ytmusicapi primary, API fallback",
     ))
 
+    # Determine tag resolution setting
+    resolve_tags = not args.no_resolve
+
     # Initialize clients
     api_client = YouTubeAPIClient(
         api_key=config.api_key,
@@ -637,7 +731,13 @@ async def main() -> int:
         output_dir=config.output_dir,
         audio_codec=config.preferred_audio_codec,
         max_concurrent=config.max_concurrent_downloads,
+        resolve_tags=resolve_tags,
     )
+
+    # Handle --resolve-all batch command
+    if args.resolve_all:
+        await _cmd_resolve_all(config)
+        return 0
 
     # Determine mode of operation
     try:

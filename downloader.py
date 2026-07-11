@@ -929,6 +929,7 @@ class AudioDownloader:
     ) -> list[DownloadResult]:
         """Download multiple tracks concurrently with rate limiting."""
 
+        _reset_existing_index()  # Fresh index for this batch
         logger.info(f"Starting batch download of {len(items)} tracks...")
 
         tasks = []
@@ -964,6 +965,40 @@ def sanitize_filename(name: str, max_length: int = 150) -> str:
     return name
 
 
+_existing_index: dict[str, list[tuple[Path, str, str]]] | None = None
+
+
+def _build_existing_index(output_dir: Path) -> dict[str, list[tuple[Path, str, str]]]:
+    """Build an in-memory index of all existing audio files.
+
+    Returns a dict mapping (clean_artist, clean_title) → [(path, raw_artist, raw_title)].
+    Called once per batch, not per-file.
+    """
+    global _existing_index
+    if _existing_index is not None:
+        return _existing_index
+
+    index: dict[str, list[tuple[Path, str, str]]] = {}
+    for ext in [".mp3", ".flac", ".opus"]:
+        for file_path in output_dir.rglob(f"*{ext}"):
+            stem = file_path.stem
+            parts = [p.strip() for p in stem.split(" - ", 1)]
+            if len(parts) == 2 and parts[0]:
+                raw_artist, raw_title = parts
+            else:
+                raw_artist, raw_title = "", parts[-1] if parts else ""
+            key = (raw_artist.lower(), re.sub(r'[^a-z0-9]', '', raw_title.lower()))
+            index.setdefault(key, []).append((file_path, raw_artist, raw_title))
+    _existing_index = index
+    return index
+
+
+def _reset_existing_index() -> None:
+    """Reset the cache so a fresh batch gets its own index."""
+    global _existing_index
+    _existing_index = None
+
+
 def _find_existing_file(
     output_dir: Path,
     title: str,
@@ -973,48 +1008,35 @@ def _find_existing_file(
     """
     Check if a song already exists in the output directory.
 
+    Uses an in-memory index built once per batch (O(n) total instead of O(n²)).
     Looks for exact matches first, then fuzzy matches by title/artist.
     Returns the path if found, None otherwise.
     """
     safe_title = sanitize_filename(title)
     safe_artist = sanitize_filename(artist) if artist and artist != "Unknown Artist" else ""
 
-    # Search all supported extensions in output directory
-    for ext in [".mp3", ".flac", ".opus"]:
-        target_dir = output_dir
+    index = _build_existing_index(output_dir)
 
-        # Check exact filename match first
-        if safe_artist:
-            candidate = target_dir / f"{safe_artist} - {safe_title}{ext}"
+    # Check exact filename match first
+    if safe_artist:
+        for ext in [".mp3", ".flac", ".opus"]:
+            candidate = output_dir / f"{safe_artist} - {safe_title}{ext}"
             if candidate.exists():
                 return candidate
 
-        # Search recursively for matching files (handles Year/Genre folders)
-        for root, _, files in os.walk(target_dir):
-            for filename in files:
-                if not filename.endswith(ext):
-                    continue
+    # Check index (O(1) lookup per file)
+    clean_target_title = re.sub(r'[^a-z0-9]', '', safe_title.lower())
+    key = (safe_artist.lower(), clean_target_title)
+    if key in index:
+        for path, raw_artist, raw_title in index[key]:
+            return path
 
-                # Remove extension and split by " - "
-                stem = Path(filename).stem
-                parts = [p.strip() for p in stem.split(" - ", 1)]
-
-                if len(parts) == 2:
-                    file_artist, file_title = parts
-                else:
-                    file_artist = ""
-                    file_title = parts[0]
-
-                # Check artist match (if provided)
-                if safe_artist and file_artist.lower() != safe_artist.lower():
-                    continue
-
-                # Check title match (case-insensitive, ignore punctuation/whitespace)
-                clean_file_title = re.sub(r'[^a-z0-9]', '', file_title.lower())
-                clean_target_title = re.sub(r'[^a-z0-9]', '', safe_title.lower())
-
-                if clean_file_title == clean_target_title:
-                    return Path(root) / filename
+    # Fallback: also check with empty artist key (in case original was saved without artist)
+    if safe_artist:
+        no_artist_key = ("", clean_target_title)
+        if no_artist_key in index:
+            for path, _, _ in index[no_artist_key]:
+                return path
 
     return None
 

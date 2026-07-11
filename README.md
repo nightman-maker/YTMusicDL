@@ -13,6 +13,9 @@ Download songs and playlists from YouTube Music at **maximum audio quality**, or
 - **Year/Genre Organization**: Files are automatically organized into `downloads/{Year}/{Genre}/Artist - Title.ext`
 - **Playlist Support**: Download entire playlists with concurrent downloads (configurable concurrency)
 - **Search & Pick**: Search for songs and pick from results interactively
+- **CSV Import**: Batch download from a CSV file with Artist,Title columns
+- **Automatic Tag Resolution**: After downloading, automatically fetches fresh metadata from YouTube Music API and overwrites ID3 tags
+- **Batch Tag Resolver** (`--resolve-all`): Update tags for all previously downloaded songs in one command
 - **Rate Limiting**: Built-in retry logic and connection throttling to avoid YouTube rate limits
 - **Metadata Embedding**: ID3 tags embedded in audio files (title, artist, album, year, genre, track number)
 - **Deduplication**: Automatically skips songs that already exist in the output directory
@@ -22,7 +25,7 @@ Download songs and playlists from YouTube Music at **maximum audio quality**, or
 ```
 ┌──────────────────────────────────────────────────────┐
 │                    Input Layer                        │
-│  URLs / Playlist IDs / Text search queries            │
+│  URLs / Playlist IDs / Text search queries / CSV      │
 └──────────────────┬───────────────────────────────────┘
                    │
                    ▼
@@ -68,6 +71,7 @@ Download songs and playlists from YouTube Music at **maximum audio quality**, or
 │           Tagging & Organization                     │
 │                                                      │
 │  ID3 tags: title, artist, album, year, genre         │
+│  Auto-resolve: Fresh metadata from YouTube Music     │
 │  File structure:                                     │
 │    downloads/2024/Rock/Artist - Title.mp3            │
 │    downloads/2024/Pop/Artist - Title.flac            │
@@ -186,12 +190,63 @@ python main.py --search "Daft Punk Get Lucky"
 python main.py --search "Radiohead Creep" -n 10
 ```
 
+### Batch Download from CSV
+
+Create a CSV file with `Artist` and `Title` columns:
+
+```csv
+Artist,Title
+Adam Lambert,Ghost Town
+Queen,Bohemian Rhapsody
+Daft Punk,Get Lucky
+```
+
+Then download all songs at once:
+
+```bash
+# Download all tracks from CSV
+python main.py --csv my_songs.csv
+
+# Dry run to preview what would be downloaded
+python main.py --csv my_songs.csv --dry-run
+
+# With custom output directory and codec
+python main.py --csv my_songs.csv -o ./my-music --codec flac
+```
+
+The CSV file can have headers in any order, with optional whitespace. The tool supports UTF-8 with BOM encoding.
+
+### Automatic Tag Resolution (Default)
+
+After each download, the tool automatically fetches fresh metadata from YouTube Music API and overwrites ID3 tags with accurate title, artist, year, and genre information. This happens by default — no extra command needed.
+
+To disable automatic tag resolution:
+
+```bash
+python main.py dQw4w9WgXcQ --no-resolve
+```
+
+### Batch Tag Resolver (`--resolve-all`)
+
+Update tags for all previously downloaded songs in the output directory:
+
+```bash
+# Resolve tags for all files in downloads/
+python main.py --resolve-all
+
+# With custom output directory
+python main.py --resolve-all -o ./my-music
+```
+
+This scans all audio files (MP3, FLAC, Opus) in the output directory, searches YouTube Music by song name (extracted from filename), and updates tags with fresh metadata. Works on previously downloaded files without re-downloading.
+
 ### Dry Run (Preview)
 
 ```bash
 # See what would be downloaded without actually downloading
 python main.py dQw4w9WgXcQ --dry-run
 python main.py --playlist PLxxxxxxxxxxxxxxx --dry-run
+python main.py --csv my_songs.csv --dry-run
 ```
 
 ## Configuration
@@ -279,14 +334,15 @@ downloads/
 usage: yt-music-downloader [-h] [--playlist PLAYLIST] [--search SEARCH]
                            [--output-dir OUTPUT_DIR] [--codec {mp3,flac,opus}]
                            [--max-results MAX_RESULTS] [--concurrent CONCURRENT]
-                           [--dry-run] [--quiet]
+                           [--dry-run] [--quiet] [--resolve-tags] [--no-resolve]
+                           [--resolve-all] [--csv FILE]
                            [input]
 
 positional arguments:
   input                 YouTube Music URL, video ID, or playlist link
 
 options:
-  -h, --help            show this help message and exit
+  -h, --help            show this help and exit
   -p, --playlist PLAYLIST
                         Download all tracks from a YouTube playlist
   -s, --search SEARCH   Search for a song and pick from results
@@ -300,6 +356,20 @@ options:
                         Max concurrent downloads
   --dry-run             Show what would be downloaded without downloading
   -q, --quiet           Suppress progress output
+  -r, --resolve-tags    Resolve and update tags with fresh metadata from
+                        YouTube Music (default: on)
+      --no-resolve      Disable automatic tag resolution after download
+      --resolve-all     Resolve tags for all previously downloaded songs in
+                        the output directory
+      --csv FILE        Download songs from a CSV file (columns: Artist,Title)
+
+Examples:
+  yt-music-downloader https://music.youtube.com/watch?v=dQw4w9WgXcQ
+  yt-music-downloader --playlist PLxxxxxxxxxxxxxxx
+  yt-music-downloader --search "Daft Punk Get Lucky"
+  yt-music-downloader dQw4w9WgXcQ
+
+Metadata is extracted from yt-dlp (FREE). YouTube API is used only as fallback.
 ```
 
 ## Codec Comparison

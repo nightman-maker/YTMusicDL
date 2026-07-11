@@ -35,9 +35,13 @@ if sys.platform == "win32":
 else:
     console = Console()
 from rich.progress import (
+    BarColumn,
+    DownloadColumn,
     Progress,
     SpinnerColumn,
     TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
 )
 from rich.table import Table
 
@@ -136,6 +140,10 @@ Metadata is extracted from yt-dlp (FREE). YouTube API is used only as fallback.
     parser.add_argument(
         "--resolve-all", action="store_true",
         help="Resolve tags for all previously downloaded songs in the output directory",
+    )
+    parser.add_argument(
+        "--csv", type=Path, metavar="FILE",
+        help="Download songs from a CSV file (columns: Artist,Title)",
     )
 
     return parser
@@ -582,6 +590,151 @@ async def search_and_download(
             print("(error) Invalid input. Enter a number or 'a'.")
 
 
+# ─── CSV Import Download ─────────────────────────────────────────────
+
+async def download_from_csv(
+    config: Config,
+    api_client: YouTubeAPIClient,
+    downloader: AudioDownloader,
+    csv_path: Path,
+) -> None:
+    """Download songs from a CSV file with Artist,Title columns."""
+
+    if not csv_path.exists():
+        print(f"(ERROR) CSV file not found: {csv_path}")
+        return
+
+    import csv as _csv
+
+    # Read and parse the CSV file — try multiple encodings for compatibility
+    rows = []
+    csv_content = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(csv_path, "r", encoding=encoding) as f:
+                csv_content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if csv_content is None:
+        print(f"(ERROR) Could not decode CSV file '{csv_path}'. Try saving it as UTF-8.")
+        return
+
+    # Auto-detect delimiter: try comma first, then semicolon (common in EU locales)
+    sample_line = csv_content.splitlines()[0]
+    if ";" in sample_line and "," not in sample_line:
+        delimiter = ";"
+    elif ";" in sample_line and "," in sample_line:
+        # Both present — count occurrences to decide
+        semicolons = sample_line.count(";")
+        commas = sample_line.count(",")
+        delimiter = ";" if semicolons > commas else ","
+    else:
+        delimiter = ","
+
+    try:
+        reader = _csv.DictReader(csv_content.splitlines(), delimiter=delimiter)
+        if not reader.fieldnames:
+            print("(ERROR) CSV file is empty or has no headers.")
+            return
+
+        # Normalize header names (strip whitespace, lowercase)
+        field_map = {h.strip().lower(): h for h in reader.fieldnames}
+        artist_col = field_map.get("artist")
+        title_col = field_map.get("title")
+
+        if not artist_col or not title_col:
+            print(
+                f"(ERROR) CSV must have 'Artist' and 'Title' columns. "
+                f"Found: {reader.fieldnames}"
+            )
+            return
+
+        for row in reader:
+            artist = (row.get(artist_col) or "").strip()
+            title = (row.get(title_col) or "").strip()
+            if artist and title:
+                rows.append((artist, title))
+
+    except Exception as e:
+        print(f"(ERROR) Failed to read CSV: {e}")
+        return
+
+    total = len(rows)
+    if total == 0:
+        print("(INFO) No valid Artist/Title pairs found in CSV.")
+        return
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]CSV Import[/bold cyan]\n"
+            f"[dim]{csv_path} | {total} track(s)[/dim]",
+            subtitle="Downloading from YouTube Music API",
+        )
+    )
+
+    if config.dry_run:
+        print("\n(dry-run) Preview of what would be downloaded:\n")
+        for idx, (artist, title) in enumerate(rows, 1):
+            print(f"  {idx}. {title} — {artist}")
+        return
+
+    # Search each song and download the first match
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.fields[track]}[/bold cyan]"),
+        BarColumn(bar_width=30),
+        TextColumn("{task.percentage:>6.1f}%"),
+        TimeRemainingColumn(),
+        console=Console(file=sys.stderr, force_terminal=True, color_system="standard" if sys.platform == "win32" else None),
+    ) as progress:
+
+        for idx, (artist, title) in enumerate(rows, 1):
+            track_display = f"{idx}/{total} {title}"
+            task = progress.add_task(
+                f"[{track_display}]",
+                track=track_display,
+                total=None,
+            )
+
+            # Search for the song
+            search_query = f"{artist} {title}"
+            print(f"\n[{idx}/{total}] Searching: {search_query}")
+
+            try:
+                results = api_client.search_by_query(search_query, max_results=1)
+
+                if not results:
+                    print(f"  ⏭ Skipped: No match found")
+                    skipped_count += 1
+                    progress.update(task, completed=100)
+                    continue
+
+                # Download the first result
+                video_id = results[0]["video_id"]
+                await download_single_track(config, api_client, downloader, video_id)
+                success_count += 1
+
+            except Exception as e:
+                print(f"  ✗ Failed: {str(e)[:80]}")
+                failed_count += 1
+
+            progress.update(task, completed=100)
+            # Small delay between downloads to avoid rate limiting
+            if idx < total:
+                await asyncio.sleep(2.0)
+
+    # Print summary
+    print("\n" + "=" * 40)
+    print(f"CSV Import Summary: {success_count} downloaded, {skipped_count} skipped, {failed_count} failed")
+    print("=" * 40)
+
+
 # ─── Resolve Tags Batch Command ──────────────────────────────────────
 
 async def _cmd_resolve_all(config: Config) -> None:
@@ -733,6 +886,11 @@ async def main() -> int:
         max_concurrent=config.max_concurrent_downloads,
         resolve_tags=resolve_tags,
     )
+
+    # Handle --csv import
+    if args.csv:
+        await download_from_csv(config, api_client, downloader, args.csv)
+        return 0
 
     # Handle --resolve-all batch command
     if args.resolve_all:
